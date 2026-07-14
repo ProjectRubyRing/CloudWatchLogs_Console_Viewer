@@ -119,6 +119,11 @@ LOG_STREAM=""
 LOG_STREAM_PREFIX=""
 SELECT_LOG_STREAM="false"
 
+# 一覧出力モード（イベント取得は行わず、一覧を指定箇所へ出力して終了する）
+LIST_LOG_GROUPS="false"    # --list-log-groups
+LIST_LOG_STREAMS="false"   # --list-log-streams
+OUTPUT_FILE=""             # --output-file / -o（未指定なら標準出力）
+
 START_STR=""
 END_STR=""
 LAST_MINUTES=""
@@ -191,6 +196,13 @@ ${SCRIPT_NAME} ${VERSION}
   -s, --log-stream NAME      特定のログストリームを指定する（get-log-events を使用）
       --log-stream-prefix P  対象ログストリームをプレフィックスで絞り込む
       --select-log-stream    ログストリームを一覧表示し番号で選択する
+
+一覧の出力（イベントは取得せず、一覧を指定箇所へ出力して終了）:
+      --list-log-groups      ロググループ一覧を取得して出力する
+      --list-log-streams     ログストリーム一覧を取得して出力する（--log-group が必須）
+  -o, --output-file FILE     一覧の出力先ファイル（未指定なら標準出力）
+                             ※ 出力形式は --output（text|tsv|jsonl）に従う
+                             ※ 絞り込みは --log-group-prefix / --log-stream-prefix を使用
 
 期間指定（すべて JST として解釈）:
       --start "YYYY-MM-DD HH:MM[:SS]"   取得開始日時（ISO8601 +09:00 形式も可）
@@ -285,6 +297,14 @@ AWS 接続:
 
   # JSON Lines で出力
   ./${SCRIPT_NAME} --log-group /aws/lambda/example --last-minutes 10 --output jsonl
+
+  # ロググループ一覧をファイルへ出力（プレフィックス絞り込み）
+  ./${SCRIPT_NAME} --list-log-groups --log-group-prefix /aws/lambda/ \\
+    --output-file log-groups.txt
+
+  # ログストリーム一覧を TSV でファイルへ出力
+  ./${SCRIPT_NAME} --list-log-streams --log-group /aws/lambda/example \\
+    --output tsv --output-file streams.tsv
 USAGE
 }
 
@@ -304,6 +324,9 @@ parse_args() {
       -s|--log-stream)       need_val "$1" "${2:-}"; LOG_STREAM="$2"; shift 2 ;;
       --log-stream-prefix)   need_val "$1" "${2:-}"; LOG_STREAM_PREFIX="$2"; shift 2 ;;
       --select-log-stream)   SELECT_LOG_STREAM="true"; shift ;;
+      --list-log-groups)     LIST_LOG_GROUPS="true"; shift ;;
+      --list-log-streams)    LIST_LOG_STREAMS="true"; shift ;;
+      -o|--output-file)      need_val "$1" "${2:-}"; OUTPUT_FILE="$2"; shift 2 ;;
       --start)               need_val "$1" "${2:-}"; START_STR="$2"; shift 2 ;;
       --end)                 need_val "$1" "${2:-}"; END_STR="$2"; shift 2 ;;
       -m|--last-minutes)     need_val "$1" "${2:-}"; LAST_MINUTES="$2"; shift 2 ;;
@@ -403,8 +426,20 @@ validate_inputs() {
     die "--log-stream と --log-stream-prefix は同時に指定できません。" "$EX_USAGE"
   fi
 
-  # --- 非対話モードでロググループ未指定はエラー ---
-  if [[ "$NON_INTERACTIVE" == "true" && -z "$LOG_GROUP" ]]; then
+  # --- 一覧出力モードの整合性 ---
+  if [[ "$LIST_LOG_GROUPS" == "true" && "$LIST_LOG_STREAMS" == "true" ]]; then
+    die "--list-log-groups と --list-log-streams は同時に指定できません（どちらか一方）。" "$EX_USAGE"
+  fi
+  if [[ "$LIST_LOG_STREAMS" == "true" && -z "$LOG_GROUP" ]]; then
+    die "--list-log-streams を使う場合は --log-group も指定してください。" "$EX_USAGE"
+  fi
+  if [[ ( "$LIST_LOG_GROUPS" == "true" || "$LIST_LOG_STREAMS" == "true" ) && "$FOLLOW" == "true" ]]; then
+    die "一覧出力モード（--list-log-groups / --list-log-streams）は --follow と併用できません。" "$EX_USAGE"
+  fi
+
+  # --- 非対話モードでロググループ未指定はエラー（一覧出力モードは一覧選択を行わないため対象外）---
+  if [[ "$NON_INTERACTIVE" == "true" && -z "$LOG_GROUP" \
+        && "$LIST_LOG_GROUPS" != "true" && "$LIST_LOG_STREAMS" != "true" ]]; then
     die "--non-interactive では --log-group の指定が必須です（一覧選択は行いません）。" "$EX_USAGE"
   fi
 
@@ -856,6 +891,171 @@ fetch_log_streams() {
 strip_stream_label() { printf '%s' "${1%%    最終: *}"; }
 
 # ===========================================================================
+# 12.5 ロググループ / ログストリーム一覧の出力（指定箇所へ書き出し）
+#   対話メニュー（select_from_list）とは別に、一覧をそのまま text/tsv/jsonl で
+#   指定した箇所（--output-file、未指定なら標準出力）へ出力する機能。
+#   時刻は TZ 非依存でJST化する（epoch 秒へ +off して gmtime|strftime）。
+# ===========================================================================
+# jq 用: epoch ミリ秒 -> "YYYY-MM-DD HH:MM:SS.mmm JST"（null は "-"）。--argjson off 必須。
+readonly JQ_JST_DEF='def jst(ms):
+    if (ms == null) then "-"
+    else ((((ms/1000)|floor)+$off)|gmtime|strftime("%Y-%m-%d %H:%M:%S"))
+         + "." + (((ms%1000)+1000)|tostring|.[1:]) + " JST"
+    end;'
+
+# 出力先パスを返す（--output-file 指定なら実ファイル、未指定なら /dev/stdout）
+list_output_dest() {
+  if [[ -n "$OUTPUT_FILE" ]]; then printf '%s' "$OUTPUT_FILE"; else printf '/dev/stdout'; fi
+}
+
+# 出力先が書き込み可能か事前確認し、ファイル指定時は空で作成（truncate）する
+prepare_output_file() {
+  [[ -z "$OUTPUT_FILE" ]] && return 0
+  local dir; dir="$(dirname -- "$OUTPUT_FILE")"
+  [[ -d "$dir" ]] || die "出力先ディレクトリが存在しません: ${dir}" "$EX_USAGE"
+  : > "$OUTPUT_FILE" 2>/dev/null || die "出力先ファイルに書き込めません: ${OUTPUT_FILE}" "$EX_USAGE"
+  return 0
+}
+
+# ロググループを全ページ取得し、各要素を 1 行の JSON として out_json へ蓄積する
+collect_log_groups_json() {
+  local out_json="$1" token="" resp next
+  while :; do
+    local args=(logs describe-log-groups --no-paginate --output json)
+    [[ -n "$LOG_GROUP_PREFIX" ]] && args+=(--log-group-name-prefix "$LOG_GROUP_PREFIX")
+    [[ -n "$token" ]]           && args+=(--next-token "$token")
+    if ! run_aws "${args[@]}"; then handle_fetch_error "ロググループ一覧取得"; fi
+    resp="$AWS_OUT"
+    printf '%s' "$resp" | jq -c '.logGroups[]?' >> "$out_json"
+    next="$(printf '%s' "$resp" | jq -r '.nextToken // ""')"; next="${next%$'\r'}"
+    [[ -z "$next" || "$next" == "None" ]] && break
+    token="$next"
+  done
+}
+
+# ログストリームを全ページ取得し、各要素を 1 行の JSON として out_json へ蓄積する。
+#   プレフィックス指定時は LogStreamNamePrefix（order-by は使えない制約に注意）、
+#   未指定時は最終イベント時刻の新しい順で取得する。
+collect_log_streams_json() {
+  local group="$1" out_json="$2" token="" resp next
+  while :; do
+    local args=(logs describe-log-streams --no-paginate
+                --log-group-name "$group" --output json)
+    if [[ -n "$LOG_STREAM_PREFIX" ]]; then
+      args+=(--log-stream-name-prefix "$LOG_STREAM_PREFIX")
+    else
+      args+=(--order-by LastEventTime --descending)
+    fi
+    [[ -n "$token" ]] && args+=(--next-token "$token")
+    if ! run_aws "${args[@]}"; then handle_fetch_error "ログストリーム一覧取得"; fi
+    resp="$AWS_OUT"
+    printf '%s' "$resp" | jq -c '.logStreams[]?' >> "$out_json"
+    next="$(printf '%s' "$resp" | jq -r '.nextToken // ""')"; next="${next%$'\r'}"
+    [[ -z "$next" || "$next" == "None" ]] && break
+    token="$next"
+  done
+}
+
+# ロググループ一覧を OUTPUT 形式で dest へ整形出力する
+format_group_list() {
+  local json="$1" dest="$2"
+  case "$OUTPUT" in
+    text)
+      # ロググループ名のみ（1 行 1 件・名前で昇順）
+      jq -r '.logGroupName' "$json" | LC_ALL=C sort -u > "$dest"
+      ;;
+    tsv)
+      # 名前 \t 保存バイト \t 保持日数 \t 作成時刻(JST)
+      jq -r --argjson off "$JST_OFFSET_SECONDS" "$JQ_JST_DEF"'
+        [ .logGroupName,
+          ((.storedBytes // 0)|tostring),
+          ((.retentionInDays // "")|tostring),
+          jst(.creationTime) ] | @tsv' "$json" > "$dest"
+      ;;
+    jsonl)
+      jq -c --argjson off "$JST_OFFSET_SECONDS" "$JQ_JST_DEF"'
+        { logGroupName,
+          storedBytes: (.storedBytes // null),
+          retentionInDays: (.retentionInDays // null),
+          creationTime: (.creationTime // null),
+          creationTime_jst: jst(.creationTime),
+          arn: (.arn // null) }' "$json" > "$dest"
+      ;;
+  esac
+}
+
+# ログストリーム一覧を OUTPUT 形式で dest へ整形出力する
+format_stream_list() {
+  local group="$1" json="$2" dest="$3"
+  case "$OUTPUT" in
+    text)
+      # 名前 \t 最終イベント時刻(JST)（@tsv は使わず名前をそのまま出す）
+      jq -r --argjson off "$JST_OFFSET_SECONDS" "$JQ_JST_DEF"'
+        .logStreamName + "\t" + jst(.lastEventTimestamp)' "$json" > "$dest"
+      ;;
+    tsv)
+      # 名前 \t 最終(ms) \t 最終(JST) \t 最初(ms) \t 最初(JST) \t 取込(ms)
+      jq -r --argjson off "$JST_OFFSET_SECONDS" "$JQ_JST_DEF"'
+        [ .logStreamName,
+          ((.lastEventTimestamp // "")|tostring),  jst(.lastEventTimestamp),
+          ((.firstEventTimestamp // "")|tostring), jst(.firstEventTimestamp),
+          ((.lastIngestionTime // "")|tostring) ] | @tsv' "$json" > "$dest"
+      ;;
+    jsonl)
+      jq -c --arg lg "$group" --argjson off "$JST_OFFSET_SECONDS" "$JQ_JST_DEF"'
+        { logGroup: $lg,
+          logStreamName,
+          firstEventTimestamp: (.firstEventTimestamp // null),
+          firstEventTimestamp_jst: jst(.firstEventTimestamp),
+          lastEventTimestamp: (.lastEventTimestamp // null),
+          lastEventTimestamp_jst: jst(.lastEventTimestamp),
+          lastIngestionTime: (.lastIngestionTime // null),
+          arn: (.arn // null) }' "$json" > "$dest"
+      ;;
+  esac
+}
+
+# 一覧出力モードの実行計画表示（確認・dry-run 用）
+print_list_plan() {
+  log_info "=== 実行計画（一覧出力）==="
+  if [[ "$LIST_LOG_GROUPS" == "true" ]]; then
+    log_info "  種別          : ロググループ一覧"
+    log_info "  プレフィックス: ${LOG_GROUP_PREFIX:-(なし)}"
+  else
+    log_info "  種別          : ログストリーム一覧"
+    log_info "  ロググループ  : ${LOG_GROUP}"
+    log_info "  プレフィックス: ${LOG_STREAM_PREFIX:-(なし)}"
+  fi
+  log_info "  出力形式      : ${OUTPUT}"
+  log_info "  出力先        : ${OUTPUT_FILE:-(標準出力)}"
+}
+
+# 一覧出力モードの本体（取得 -> 整形 -> 指定箇所へ出力）
+run_list_mode() {
+  prepare_output_file
+  local dest json cnt
+  dest="$(list_output_dest)"
+  json="$(mktemp_tracked)"
+
+  if [[ "$LIST_LOG_GROUPS" == "true" ]]; then
+    log_info "ロググループ一覧を取得しています${LOG_GROUP_PREFIX:+（プレフィックス: ${LOG_GROUP_PREFIX}）}..."
+    collect_log_groups_json "$json"
+    [[ -s "$json" ]] || die "ロググループが 1 件もありません（リージョンやプレフィックスを確認してください）。" "$EX_NOTFOUND"
+    format_group_list "$json" "$dest"
+    cnt="$(wc -l < "$json" | tr -d ' ')"
+    log_success "ロググループ ${cnt} 件を出力しました${OUTPUT_FILE:+（-> ${OUTPUT_FILE}）}（形式: ${OUTPUT}）。"
+  else
+    log_info "ログストリーム一覧を取得しています: ${LOG_GROUP}${LOG_STREAM_PREFIX:+（プレフィックス: ${LOG_STREAM_PREFIX}）}..."
+    collect_log_streams_json "$LOG_GROUP" "$json"
+    [[ -s "$json" ]] || die "ロググループ '${LOG_GROUP}' にログストリームがありません。" "$EX_NOTFOUND"
+    format_stream_list "$LOG_GROUP" "$json" "$dest"
+    cnt="$(wc -l < "$json" | tr -d ' ')"
+    log_success "ログストリーム ${cnt} 件を出力しました${OUTPUT_FILE:+（-> ${OUTPUT_FILE}）}（形式: ${OUTPUT}）。"
+  fi
+  return 0
+}
+
+# ===========================================================================
 # 13. メッセージのエスケープ解除・整形補助
 # ===========================================================================
 # jq の @tsv は message 中の \t \n \r \\ をエスケープする。以下でその逆変換を行う。
@@ -1248,6 +1448,12 @@ main() {
 
   # dry-run は AWS へアクセスせず、解決した計画のみ表示して終了（読み取りも行わない）
   if [[ "$DRY_RUN" == "true" ]]; then
+    # 一覧出力モードは期間・イベント取得に関係しないため専用の計画を表示する
+    if [[ "$LIST_LOG_GROUPS" == "true" || "$LIST_LOG_STREAMS" == "true" ]]; then
+      log_warn "dry-run: AWS への参照は行いません。予定内容のみ表示します。"
+      print_list_plan
+      exit "$EX_OK"
+    fi
     # 期間の算出だけは行う（AWS 非依存）
     resolve_time_range
     log_warn "dry-run: AWS への参照・スイッチバックは行いません。予定内容のみ表示します。"
@@ -1263,6 +1469,12 @@ main() {
   build_aws_global
   require_authenticated
   ensure_logs_permission_or_switchback
+
+  # 一覧出力モード: イベント取得は行わず、一覧を指定箇所へ出力して終了する
+  if [[ "$LIST_LOG_GROUPS" == "true" || "$LIST_LOG_STREAMS" == "true" ]]; then
+    run_list_mode
+    exit "$EX_OK"
+  fi
 
   # ロググループの解決（未指定なら一覧選択）
   if [[ -z "$LOG_GROUP" ]]; then

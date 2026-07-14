@@ -3,8 +3,8 @@
 TeraTerm から接続した Linux サーバー上で実行し、AWS CloudWatch Logs のログを
 **「JST のログ出力時刻 | ログメッセージ」** の見やすい形式で確認する実運用向け
 Bash ツールです。期間指定・直近 N 分・フィルタ・`tail -f` 相当の監視・
-ロググループ/ストリームの対話選択・AWS 認証/権限確認・権限不足時のスイッチバック
-案内/自動実行に対応します。
+ロググループ/ストリームの対話選択・**ロググループ/ストリーム一覧の指定箇所への出力**・
+AWS 認証/権限確認・権限不足時のスイッチバック案内/自動実行に対応します。
 
 ---
 
@@ -115,7 +115,44 @@ shellcheck -x cloudwatch-log-viewer.sh common.sh   # shellcheck 導入時
 
 # JSON Lines で出力
 ./cloudwatch-log-viewer.sh --log-group /aws/lambda/example --last-minutes 10 --output jsonl
+
+# ロググループ一覧をファイルへ出力（プレフィックス絞り込み）
+./cloudwatch-log-viewer.sh --list-log-groups --log-group-prefix /aws/lambda/ \
+  --output-file log-groups.txt
+
+# ロググループ一覧を標準出力へ（パイプで加工可能）
+./cloudwatch-log-viewer.sh --list-log-groups 2>/dev/null | grep prod
+
+# ログストリーム一覧を TSV でファイルへ出力（最終イベント時刻の新しい順）
+./cloudwatch-log-viewer.sh --list-log-streams --log-group /aws/lambda/example \
+  --output tsv --output-file streams.tsv
+
+# ログストリーム一覧を JSON Lines で（プレフィックス絞り込み）
+./cloudwatch-log-viewer.sh --list-log-streams --log-group /aws/lambda/example \
+  --log-stream-prefix 2026/07/ --output jsonl -o streams.jsonl
 ```
+
+### 一覧の出力（`--list-log-groups` / `--list-log-streams`）
+
+ログイベントの取得は行わず、ロググループ／ログストリームの**一覧そのもの**を
+`--output-file`（`-o`）で指定した箇所（未指定なら標準出力）へ書き出す専用モードです。
+出力形式は `--output`（`text` / `tsv` / `jsonl`）に従います。
+
+- `--list-log-groups` … ロググループ一覧。`--log-group-prefix` で絞り込み可。
+- `--list-log-streams` … ログストリーム一覧（`--log-group` が必須）。
+  `--log-stream-prefix` で絞り込み可。未指定時は最終イベント時刻の新しい順。
+
+出力形式ごとの列（時刻はすべて JST）:
+
+| 形式 | ロググループ | ログストリーム |
+|---|---|---|
+| `text` | ロググループ名のみ（名前昇順） | `名前 \t 最終イベント時刻` |
+| `tsv` | `名前 \t 保存バイト \t 保持日数 \t 作成時刻` | `名前 \t 最終(ms) \t 最終(JST) \t 最初(ms) \t 最初(JST) \t 取込(ms)` |
+| `jsonl` | 名前・保存バイト・保持日数・作成時刻(+JST)・ARN | ロググループ・名前・最初/最終/取込時刻(+JST)・ARN |
+
+> ログ・診断メッセージは標準エラーへ出力するため、`--output-file` を省略しても
+> 一覧本体（標準出力）とは混ざりません。パイプでそのまま加工できます。
+> `--list-*` は `--follow` と併用できず、両方の `--list-*` を同時指定するとエラーです。
 
 ---
 
@@ -128,6 +165,9 @@ shellcheck -x cloudwatch-log-viewer.sh common.sh   # shellcheck 導入時
 | `-s, --log-stream NAME` | 特定のログストリームを指定（`get-log-events` を使用） |
 | `--log-stream-prefix P` | 対象ログストリームをプレフィックスで絞り込む |
 | `--select-log-stream` | ログストリームを一覧表示し番号で選択 |
+| `--list-log-groups` | ロググループ一覧を取得して指定箇所へ出力（イベントは取得しない） |
+| `--list-log-streams` | ログストリーム一覧を取得して指定箇所へ出力（`--log-group` 必須） |
+| `-o, --output-file FILE` | 一覧の出力先ファイル（未指定なら標準出力） |
 | `--start "YYYY-MM-DD HH:MM[:SS]"` | 取得開始日時（JST。ISO8601 +09:00 も可） |
 | `--end "YYYY-MM-DD HH:MM[:SS]"` | 取得終了日時（JST。秒単位で inclusive） |
 | `-m, --last-minutes N` | 直近 N 分（1〜10080）。`--start`/`--end` と併用不可 |
@@ -297,6 +337,9 @@ aws login --remote                      # 事前認証
 - 監視: 新規ログ表示 / 新規ストリーム / 遅延到着 / 重複排除 / 一時 API エラー / Ctrl+C
 - スイッチバック: 警告終了 / 自動成功 / 自動失敗 / 再確認後も権限不足 / 未指定 / 不存在 / パスに空白
 - 出力: text / tsv / jsonl / パイプ・リダイレクト / `--non-interactive`
+- 一覧出力: `--list-log-groups` / `--list-log-streams` / 標準出力・`--output-file` /
+  text・tsv・jsonl / プレフィックス絞り込み / 0 件 / 出力先ディレクトリ不存在・書込不可 /
+  `--follow` 併用不可・両 `--list-*` 同時指定不可・`--log-group` 必須
 
 ---
 
