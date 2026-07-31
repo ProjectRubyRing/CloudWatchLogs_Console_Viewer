@@ -15,7 +15,8 @@
 #     除外フィルタ・大文字小文字無視・複数条件の AND/OR
 #   - tail -f 相当のリアルタイム監視（ポーリング方式・遅延到着対策・重複排除）
 #   - 出力形式 text / tsv / jsonl / none
-#   - Excel 出力（--excel）: ロググループごとにシートを分けて 1 ファイルへ書き出す
+#   - Excel 出力（--excel）: ロググループ × ログストリームごとにシートを分けて
+#     1 ファイルへ書き出す（各ロググループの最新ストリーム以外のシートは既定で非表示）
 #     フォントは Meiryo UI。JBoss EAP のログは区分（起動 / 停止 / デプロイ /
 #     アンデプロイ / エラー / 警告）ごとに色分けし、「主要イベント」シートに集約する
 #   - 生テキストログの出力: ロググループ × ログストリームごとに 1 ファイルへ分けて
@@ -49,7 +50,7 @@ set -Eeuo pipefail
 # ===========================================================================
 # 0. 基本設定
 # ===========================================================================
-VERSION="1.2.0"
+VERSION="1.3.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 
@@ -207,8 +208,8 @@ FETCH_START_MS=""      # CloudWatch へ要求する取得開始（START_MS - マ
 FETCH_END_MS=""        # CloudWatch へ要求する取得終了（END_MS + マージン）
 ENGINE=""              # get|filter（使用する AWS API）
 AWS_GLOBAL=()          # aws のグローバル引数（--profile/--region）
-TMP_FILES=()           # trap で削除する一時ファイル
-TMP_DIRS=()            # trap で削除する一時ディレクトリ（xlsx 組み立て用）
+TMP_LIST=""            # trap で削除する一時ファイルの一覧（1 行 1 パス）
+TMP_DIR_LIST=""        # trap で削除する一時ディレクトリの一覧（xlsx 組み立て用）
 AWS_OUT=""             # run_aws の標準出力
 AWS_ERR=""             # run_aws の標準エラー
 FETCHED=0              # 直近フェッチで取得したイベント数
@@ -217,11 +218,12 @@ MAXTS=""               # 直近フェッチで観測した最大タイムスタ�
 SWITCHBACK_DONE="false"
 declare -A SEEN=()     # follow モードの重複排除（key -> timestamp）
 
-# --- 出力用の収集バッファ（ロググループ 1 件につき 1 シート / 1 組の生ログ） ---
+# --- 出力用の収集バッファ（ロググループ 1 件につき 1 ファイル / 1 組の生ログ） ---
+#   Excel はこのファイルをさらにログストリームごとへ分割してシートにする（17.5）
 COLLECT_BUF=""         # emit_events が追記する現在のバッファ（空なら収集しない）
 COLLECT_MIN=""         # 現在のグループで出力した最古のログ時刻
 COLLECT_MAX=""         # 現在のグループで出力した最新のログ時刻
-GRP_NAMES=()           # シート化するロググループ名
+GRP_NAMES=()           # 出力対象のロググループ名
 GRP_FILES=()           # 対応する行バッファ（US 区切り・ログ時刻昇順）
 GRP_FETCHED=()         # 取得件数（CloudWatch から受け取った件数）
 GRP_MATCHED=()         # 出力件数（期間・フィルタを通過した件数）
@@ -252,7 +254,8 @@ ${SCRIPT_NAME} ${VERSION}
   ロググループは複数指定でき、複数を横断して検索・出力できます。
   画面にはロググループごとに区切って表示します。
   --excel を付けると、次のファイルを作成します。
-    ・Excel ブック（ロググループごとにシートを分割 / フォントは Meiryo UI /
+    ・Excel ブック（ロググループ × ログストリームごとにシートを分割 /
+      最新ストリーム以外のシートは既定で非表示 / フォントは Meiryo UI /
       JBoss EAP のログは区分ごとに色分け / 「主要イベント」シートを併設）
     ・生テキストログ（ロググループ × ログストリームごとに 1 ファイル。
       Excel と同じフォルダへ出力。--no-raw-text で抑止、--raw-dir で変更可）
@@ -317,9 +320,13 @@ ${SCRIPT_NAME} ${VERSION}
                              ※ ロググループ 1 件あたりの上限として適用されます
       --page-limit N         AWS API 1 回あたりの取得件数（既定: ${PAGE_LIMIT}, 最大 10000）
 
-Excel 出力（ロググループごとにシートを分ける）:
+Excel 出力（ロググループ × ログストリームごとにシートを分ける）:
       --excel FILE           Excel ファイルへ出力する（画面表示と併用可）
-                             シート構成: サマリ / 主要イベント / ロググループごとに 1 シート
+                             シート構成: サマリ / 主要イベント / ストリーム一覧 /
+                             ロググループ × ログストリームごとに 1 シート
+                             各ロググループの最新ログストリームのシートだけを表示し、
+                             それ以外のシートは既定で非表示にします
+                             （Excel のシート見出しを右クリック →「再表示」で表示可）
                              フォントは Meiryo UI。行はログの区分ごとに色分けされます
       --excel-format FORMAT  xlsx | xml （既定: FILE の拡張子から自動判定。既定は xlsx）
                              xlsx: 通常の Excel ブック（zip コマンドが必要）
@@ -775,17 +782,32 @@ resolve_show_group() {
 # ===========================================================================
 # 7. 一時ファイルとシグナル処理
 # ===========================================================================
+#   作成した一時ファイル・ディレクトリの記録は「配列」ではなく「ファイル」で持つ。
+#   mktemp_tracked は x="$(mktemp_tracked)" の形（= サブシェル）で呼ばれるため、
+#   配列へ追記しても親シェルには残らず、後片付けが一切行われないため。
 cleanup() {
   local f d
-  for f in ${TMP_FILES[@]+"${TMP_FILES[@]}"}; do
-    [[ -n "$f" && -f "$f" ]] && rm -f "$f" 2>/dev/null || true
-  done
-  for d in ${TMP_DIRS[@]+"${TMP_DIRS[@]}"}; do
-    # mktemp -d で作った自分専用のディレクトリのみを対象にする（誤削除防止）
-    [[ -n "$d" && -d "$d" && "$d" == */cwlv.* ]] && rm -rf -- "$d" 2>/dev/null || true
-  done
+  if [[ -n "$TMP_LIST" && -f "$TMP_LIST" ]]; then
+    while IFS= read -r f; do
+      if [[ -n "$f" && -f "$f" ]]; then rm -f -- "$f" 2>/dev/null || true; fi
+    done < "$TMP_LIST"
+    rm -f -- "$TMP_LIST" 2>/dev/null || true
+  fi
+  if [[ -n "$TMP_DIR_LIST" && -f "$TMP_DIR_LIST" ]]; then
+    while IFS= read -r d; do
+      # mktemp -d で作った自分専用のディレクトリのみを対象にする（誤削除防止）
+      if [[ -n "$d" && -d "$d" && "$d" == */cwlv.* ]]; then rm -rf -- "$d" 2>/dev/null || true; fi
+    done < "$TMP_DIR_LIST"
+    rm -f -- "$TMP_DIR_LIST" 2>/dev/null || true
+  fi
+  return 0
 }
 trap cleanup EXIT
+
+# 記録用のファイルは、最初の mktemp_tracked よりも前に親シェルで作っておく
+#   （サブシェルの中で作ると、そのパスが親シェルへ伝わらないため）
+TMP_LIST="$(mktemp "${TMPDIR:-/tmp}/cwlv.list.XXXXXX" 2>/dev/null)"     || TMP_LIST=""
+TMP_DIR_LIST="$(mktemp "${TMPDIR:-/tmp}/cwlv.list.XXXXXX" 2>/dev/null)" || TMP_DIR_LIST=""
 
 on_signal() {
   # Ctrl+C / SIGTERM: スタックトレースを出さず分かりやすく終了する
@@ -798,14 +820,14 @@ trap on_signal INT TERM
 mktemp_tracked() {
   local f
   f="$(mktemp "${TMPDIR:-/tmp}/cwlv.XXXXXX")" || die "一時ファイルの作成に失敗しました。" "$EX_API"
-  TMP_FILES+=("$f")
+  [[ -n "$TMP_LIST" ]] && printf '%s\n' "$f" >> "$TMP_LIST"
   printf '%s' "$f"
 }
 
 mktempdir_tracked() {
   local d
   d="$(mktemp -d "${TMPDIR:-/tmp}/cwlv.dir.XXXXXX")" || die "一時ディレクトリの作成に失敗しました。" "$EX_OUTPUT"
-  TMP_DIRS+=("$d")
+  [[ -n "$TMP_DIR_LIST" ]] && printf '%s\n' "$d" >> "$TMP_DIR_LIST"
   printf '%s' "$d"
 }
 
@@ -1896,7 +1918,7 @@ prune_seen() {
 }
 
 # ===========================================================================
-# 17.5 Excel 出力（ロググループごとに 1 シート）
+# 17.5 Excel 出力（ロググループ × ログストリームごとに 1 シート）
 #   xlsx: Office Open XML（ZIP + XML）を自前で組み立てる。追加ライブラリは不要で、
 #         zip コマンドだけあればよい。文字列は inlineStr で書くため sharedStrings は
 #         使わない（実装が単純で、ログ用途では文字列の重複も少ないため）。
@@ -1908,8 +1930,11 @@ prune_seen() {
 # ===========================================================================
 readonly XLSX_MAX_CELL=32767      # 1 セルに入る最大文字数（Excel の仕様）
 readonly XLSX_MAX_ROWS=1048576    # 1 シートの最大行数（Excel の仕様）
-readonly XLSX_DATA_ROW=4          # 1:ロググループ名 2:条件 3:見出し 4以降:データ
-readonly XLSX_SUM_DATA_ROW=10     # サマリシートのデータ開始行
+# ログシート: 1:ロググループ名 2:ログストリーム名 3:条件 4:見出し 5以降:データ
+readonly XLSX_DATA_ROW=5
+readonly XLSX_SUM_DATA_ROW=11     # サマリシートのデータ開始行
+readonly XLSX_KEY_DATA_ROW=4      # 主要イベントシートのデータ開始行
+readonly XLSX_LIST_DATA_ROW=4     # ストリーム一覧シートのデータ開始行
 
 # Excel のフォント（全シート共通）。日本語のログを等幅に近い形で読みやすく、
 # Windows の Excel に標準搭載されている Meiryo UI を使う。
@@ -1997,9 +2022,9 @@ excel_cell_message() {
 }
 
 # シート名を作る。Excel の制約: 31 文字以内 / : \ / ? * [ ] 不可 / 重複不可。
-#   ロググループ名は先頭が共通しがち（/aws/lambda/... 等）なので、31 文字を超える
-#   場合は識別に有用な末尾側を残す。完全なロググループ名は各シートの 1 行目と
-#   サマリシートに記録するため、切り詰めても対応関係は追える。
+#   ロググループ名・ストリーム名は先頭が共通しがち（/aws/lambda/... 等）なので、
+#   31 文字を超える場合は識別に有用な末尾側を残す。完全な名前は各シートの
+#   1〜2 行目と「ストリーム一覧」シートに記録するため、切り詰めても対応関係は追える。
 #   結果は XLSX_SHEET_NAME に返す。コマンド置換で呼ぶとサブシェルになり、
 #   使用済みシート名の記録（XLSX_SHEET_USED）が呼び出し元へ残らず、
 #   同名シートを持つ壊れたブックを作ってしまうため、必ず直接呼ぶこと。
@@ -2025,6 +2050,22 @@ xlsx_sheet_name() {
   fi
   XLSX_SHEET_USED["${n,,}"]=1
   XLSX_SHEET_NAME="$n"
+}
+
+# ログストリームのシート名を作る（結果は XLSX_SHEET_NAME）。
+#   ロググループが複数あるときは、同名・似た名前のストリームを取り違えないよう
+#   「NN_」（サマリシートの No と同じ番号）を先頭に付ける。31 文字の制限は
+#   この接頭辞を残したまま守りたいので、切り詰めはここで行ってから渡す。
+xlsx_stream_sheet_name() {
+  local gidx="$1" prefix="" avail=31 name="$2"
+  # 該当するログが 1 件も無いロググループはストリーム名が無いのでグループ名で作る
+  [[ -z "$name" ]] && name="${GRP_NAMES[gidx]}"
+  if (( ${#GRP_NAMES[@]} > 1 )); then
+    printf -v prefix '%02d_' "$(( gidx + 1 ))"
+    avail=$(( 31 - ${#prefix} ))
+  fi
+  (( ${#name} > avail )) && name="${name: -avail}"
+  xlsx_sheet_name "${prefix}${name}"
 }
 
 # サマリ・各シートの見出しに載せる抽出条件の説明
@@ -2053,6 +2094,14 @@ excel_rawdir_text() {
   fi
 }
 
+# シートの分け方と非表示の扱いの説明（サマリ・ストリーム一覧の見出しに載せる）
+#   非表示のシートは「消えた」のではないと分かるよう、戻し方まで書いておく。
+readonly EXCEL_UNHIDE_HINT='非表示のシートは、シート見出しを右クリック →「再表示」で表示できます。'
+excel_sheetplan_text() {
+  printf 'ログはロググループ × ログストリームごとに 1 シート。各ロググループの最新のログストリームだけを表示し、それ以外は既定で非表示です（%s 一覧は「ストリーム一覧」シート）' \
+    "$EXCEL_UNHIDE_HINT"
+}
+
 # 期間の判定に何を使ったかの説明（Excel の見出しに載せる）
 excel_timesource_text() {
   if [[ "$TIME_SOURCE" == "message" ]]; then
@@ -2063,22 +2112,122 @@ excel_timesource_text() {
   fi
 }
 
+# --- シート単位（ロググループ × ログストリーム）の情報 -----------------------
+#   Excel のシートはログストリームごとに分ける。1 つのロググループは複数の
+#   ログストリーム（サーバー 1 台ごと・日付ごと等）を持つのが普通で、それらを
+#   1 枚に混ぜると別々の系列の時刻が入り組んで読みにくくなるため。
+#   表示するのは各ロググループで最も新しいログを持つストリームのシートだけにし、
+#   それ以外は既定で非表示にする（まず見たいのは直近のログで、シート見出しが
+#   何十枚も並ぶと目的のシートを探せなくなるため）。非表示のシートは Excel の
+#   シート見出しを右クリック →「再表示」でいつでも表示できる。
+#   配列の添字はシート番号。GRP_* と同じく、区分ごとの件数は CAT_N 個ずつ連結する。
+SHT_GIDX=()            # そのシートのロググループ番号（GRP_* の添字）
+SHT_STREAM=()          # ログストリーム名（該当ログが 0 件のロググループは空）
+SHT_FILES=()           # そのストリームの行だけを抜き出したファイル（0 件なら空）
+SHT_COUNT=()           # 出力件数
+SHT_MINTS=()           # 最古のログ時刻（0 件なら空）
+SHT_MAXTS=()           # 最新のログ時刻（0 件なら空）
+SHT_NAMES=()           # Excel のシート名
+SHT_HIDDEN=()          # true: 既定で非表示にする（最新ストリーム以外）
+SHT_CAT=()             # 色分けの区分ごとの件数
+SHT_KIND=()            # JBoss の観点の区分ごとの件数
+SHT_SPLIT_DIR=""       # ストリームごとの行ファイルを置く一時ディレクトリ
+SHT_SORT_TMP=""        # 並べ替え用の一時ファイル（使い回す）
+GRP_SHEETS=()          # ロググループごとのシート枚数（サマリシートに載せる）
+
+# 1 ロググループぶんの収集結果を、ログストリームごとのファイルへ分割する。
+#   ストリームを跨いでファイルを開き直す回数を最小にするため、まず
+#   「ストリーム名 -> ログ時刻」の順に並べ替えてから 1 度だけ走査する
+#   （生テキストログの分割と同じ考え方）。並べ替え後もストリーム内はログ時刻の
+#   昇順なので、各シートの行順は分割前と変わらない。
+excel_split_streams() {
+  local idx="$1"
+  local group="${GRP_NAMES[idx]}" src="${GRP_FILES[idx]}"
+  local mts ts ing eid ls cat kcat lvl kind emsg
+  local cur="" si=-1 base=0 c i path
+  local first=${#SHT_GIDX[@]} last latest lmax
+
+  if [[ -s "$src" ]]; then
+    LC_ALL=C sort -s -t"$US" -k5,5 -k1,1n "$src" > "$SHT_SORT_TMP" \
+      || die "ログストリームごとの並べ替えに失敗しました: ${group}" "$EX_OUTPUT"
+
+    while IFS="$US" read -r mts ts ing eid ls cat kcat lvl kind emsg; do
+      emsg="${emsg%$'\r'}"
+      [[ "$mts" =~ ^-?[0-9]+$ ]] || continue
+
+      if (( si < 0 )) || [[ "$ls" != "$cur" ]]; then
+        if (( si >= 0 )); then exec 3>&-; fi
+        cur="$ls"
+        si=${#SHT_GIDX[@]}
+        base=$(( si * CAT_N ))
+        printf -v path '%s/s%05d' "$SHT_SPLIT_DIR" "$si"
+        SHT_GIDX+=("$idx"); SHT_STREAM+=("$ls"); SHT_FILES+=("$path")
+        SHT_COUNT+=(0); SHT_MINTS+=("$mts"); SHT_MAXTS+=("$mts")
+        SHT_NAMES+=(""); SHT_HIDDEN+=("true")
+        for (( c = 0; c < CAT_N; c++ )); do SHT_CAT+=(0); SHT_KIND+=(0); done
+        exec 3>"$path" || die "Excel 用の一時ファイルを作成できません: ${path}" "$EX_OUTPUT"
+      fi
+
+      printf '%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\n' \
+        "$mts" "$ts" "$ing" "$eid" "$ls" "$cat" "$kcat" "$lvl" "$kind" "$emsg" >&3
+      SHT_COUNT[si]=$(( SHT_COUNT[si] + 1 ))
+      SHT_MAXTS[si]="$mts"        # 入力はログ時刻の昇順のため、最後に見た値が最新
+      SHT_CAT[base + cat]=$(( SHT_CAT[base + cat] + 1 ))
+      if [[ -n "$kcat" ]]; then SHT_KIND[base + kcat]=$(( SHT_KIND[base + kcat] + 1 )); fi
+    done < "$SHT_SORT_TMP"
+
+    if (( si >= 0 )); then exec 3>&-; fi
+  fi
+
+  # 1 件も該当が無いロググループにも、指定した事実が分かるようにシートを 1 枚作る
+  if (( si < 0 )); then
+    si=${#SHT_GIDX[@]}
+    SHT_GIDX+=("$idx"); SHT_STREAM+=(""); SHT_FILES+=("")
+    SHT_COUNT+=(0); SHT_MINTS+=(""); SHT_MAXTS+=("")
+    SHT_NAMES+=(""); SHT_HIDDEN+=("false")
+    for (( c = 0; c < CAT_N; c++ )); do SHT_CAT+=(0); SHT_KIND+=(0); done
+  fi
+  last=$(( ${#SHT_GIDX[@]} - 1 ))
+  GRP_SHEETS[idx]=$(( last - first + 1 ))
+
+  # 最新のログを持つストリームのシートだけを表示する
+  latest=$first; lmax="${SHT_MAXTS[first]}"
+  for (( i = first + 1; i <= last; i++ )); do
+    if [[ -n "${SHT_MAXTS[i]}" ]] && { [[ -z "$lmax" ]] || (( SHT_MAXTS[i] > lmax )); }; then
+      latest=$i; lmax="${SHT_MAXTS[i]}"
+    fi
+  done
+  SHT_HIDDEN[latest]="false"
+
+  # シート名は表示順（= 作成順）に確定させる。xlsx_sheet_name は使用済みの名前を
+  # 記録して重複を避けるため、コマンド置換にせず直接呼ぶこと
+  for (( i = first; i <= last; i++ )); do
+    xlsx_stream_sheet_name "$idx" "${SHT_STREAM[i]}"
+    SHT_NAMES[i]="$XLSX_SHEET_NAME"
+  done
+  return 0
+}
+
 # 収集結果を Excel ファイルへ書き出す（形式は EXCEL_FORMAT に従う）
-XLSX_SHEET_NAMES=()
 KEY_SORTED=""          # 主要イベントを時刻順に並べ替えたファイル
+readonly EXCEL_LIST_MAX=20    # 画面に一覧表示するシート数の上限
 excel_write() {
-  local i n=${#GRP_NAMES[@]}
+  local i n=${#GRP_NAMES[@]} sn hidden=0 shown=0 total=0 mark
   if (( n == 0 )); then
     log_warn "Excel へ書き出す対象のロググループがありません。ファイルは作成しません。"
     return 0
   fi
 
-  # XLSX_SHEET_USED は宣言時に空。excel_write は 1 回しか呼ばれないため再初期化しない
-  # （連想配列への arr=() 代入は bash の版によって属性が落ちることがあるため避ける）
-  XLSX_SHEET_NAMES=()
-  for (( i = 0; i < n; i++ )); do
-    xlsx_sheet_name "${GRP_NAMES[i]}"     # コマンド置換にしないこと（上の注記参照）
-    XLSX_SHEET_NAMES+=("$XLSX_SHEET_NAME")
+  # ロググループの収集結果をログストリームごとへ分割し、シートの構成を確定する。
+  #   シート名の重複回避に使う XLSX_SHEET_USED は宣言時に空で、excel_write は 1 回しか
+  #   呼ばれないため再初期化しない（連想配列への arr=() 代入は bash の版によって
+  #   属性が落ちることがあるため避ける）。
+  SHT_SPLIT_DIR="$(mktempdir_tracked)"
+  SHT_SORT_TMP="$(mktemp_tracked)"
+  for (( i = 0; i < n; i++ )); do excel_split_streams "$i"; done
+  sn=${#SHT_GIDX[@]}
+  for (( i = 0; i < sn; i++ )); do
+    [[ "${SHT_HIDDEN[i]}" == "true" ]] && hidden=$(( hidden + 1 ))
   done
 
   # 主要イベントはロググループを横断して時刻順に並べる（複数系統の前後関係を追うため）
@@ -2090,19 +2239,27 @@ excel_write() {
     : > "$KEY_SORTED"
   fi
 
-  log_info "Excel ファイルを作成しています（サマリ + 主要イベント + ${n} シート, 形式 ${EXCEL_FORMAT}）: ${EXCEL_FILE}"
+  log_info "Excel ファイルを作成しています（サマリ + 主要イベント + ストリーム一覧 + ログ ${sn} シート, 形式 ${EXCEL_FORMAT}）: ${EXCEL_FILE}"
   if [[ "$EXCEL_FORMAT" == "xml" ]]; then
     excel_write_spreadsheetml
   else
     excel_write_xlsx
   fi
 
-  local total=0
   for (( i = 0; i < n; i++ )); do total=$(( total + GRP_MATCHED[i] )); done
-  log_success "Excel ファイルを作成しました: ${EXCEL_FILE}（${n} ロググループ / 合計 ${total} 行）"
-  for (( i = 0; i < n; i++ )); do
-    log_info "$(printf '    [%s] %s  %d 行' "${XLSX_SHEET_NAMES[i]}" "${GRP_NAMES[i]}" "${GRP_MATCHED[i]}")"
+  log_success "Excel ファイルを作成しました: ${EXCEL_FILE}（${n} ロググループ / ログ ${sn} シート / 合計 ${total} 行）"
+  for (( i = 0; i < sn; i++ )); do
+    if (( shown >= EXCEL_LIST_MAX )); then
+      log_info "    ... ほか $(( sn - shown )) シート（一覧は「ストリーム一覧」シートを参照）"
+      break
+    fi
+    mark="表示"; [[ "${SHT_HIDDEN[i]}" == "true" ]] && mark="非表示"
+    log_info "$(printf '    [%s] %s / %s  %d 行 (%s)' \
+      "${SHT_NAMES[i]}" "${GRP_NAMES[${SHT_GIDX[i]}]}" "${SHT_STREAM[i]:-(該当なし)}" \
+      "${SHT_COUNT[i]}" "$mark")"
+    shown=$(( shown + 1 ))
   done
+  (( hidden > 0 )) && log_info "    ※ 最新ストリーム以外の ${hidden} シートは非表示です（シート見出しを右クリック →「再表示」）"
   (( KEY_COUNT > 0 )) && log_info "    [主要イベント] 起動・停止・デプロイ等  ${KEY_COUNT} 行"
   return 0
 }
@@ -2191,7 +2348,7 @@ xlsx_write_summary_sheet() {
     printf '<sheetViews><sheetView tabSelected="1" workbookViewId="0"><pane ySplit="%d" topLeftCell="A%d" activePane="bottomLeft" state="frozen"/><selection pane="bottomLeft" activeCell="A%d" sqref="A%d"/></sheetView></sheetViews>' \
       "$hrow" "$XLSX_SUM_DATA_ROW" "$XLSX_SUM_DATA_ROW" "$XLSX_SUM_DATA_ROW"
     printf '%s' '<sheetFormatPr defaultRowHeight="15"/>'
-    printf '%s' '<cols><col min="1" max="1" width="5" customWidth="1"/><col min="2" max="2" width="46" customWidth="1"/><col min="3" max="3" width="24" customWidth="1"/><col min="4" max="6" width="9" customWidth="1"/><col min="7" max="12" width="8" customWidth="1"/><col min="13" max="14" width="23" customWidth="1"/><col min="15" max="15" width="9" customWidth="1"/></cols>'
+    printf '%s' '<cols><col min="1" max="1" width="5" customWidth="1"/><col min="2" max="2" width="46" customWidth="1"/><col min="3" max="3" width="10" customWidth="1"/><col min="4" max="6" width="9" customWidth="1"/><col min="7" max="12" width="8" customWidth="1"/><col min="13" max="14" width="23" customWidth="1"/><col min="15" max="15" width="9" customWidth="1"/></cols>'
     printf '%s' '<sheetData>'
     printf '<row r="1">%s</row>' "$(xlsx_cell_str A1 "$STY_TITLE" 'CloudWatch Logs 抽出結果')"
     printf '<row r="2">%s%s</row>' "$(xlsx_cell_str A2 "$STY_LABEL" '出力日時')"   "$(xlsx_cell_str B2 0 "${now} JST")"
@@ -2201,9 +2358,10 @@ xlsx_write_summary_sheet() {
     printf '<row r="6">%s%s</row>' "$(xlsx_cell_str A6 "$STY_LABEL" '抽出条件')"   "$(xlsx_cell_str B6 0 "$cond")"
     printf '<row r="7">%s%s</row>' "$(xlsx_cell_str A7 "$STY_LABEL" '取得上限')"   "$(xlsx_cell_str B7 0 "ロググループごとに最大 ${MAX_EVENTS} 件")"
     printf '<row r="8">%s%s</row>' "$(xlsx_cell_str A8 "$STY_LABEL" '生ログ')"     "$(xlsx_cell_str B8 0 "$(excel_rawdir_text)")"
+    printf '<row r="9">%s%s</row>' "$(xlsx_cell_str A9 "$STY_LABEL" 'シート構成')" "$(xlsx_cell_str B9 0 "$(excel_sheetplan_text)")"
     printf '<row r="%d">%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s</row>' "$hrow" \
       "$(xlsx_cell_str "A${hrow}" "$STY_HEAD" 'No')"          "$(xlsx_cell_str "B${hrow}" "$STY_HEAD" 'ロググループ')" \
-      "$(xlsx_cell_str "C${hrow}" "$STY_HEAD" 'シート名')"    "$(xlsx_cell_str "D${hrow}" "$STY_HEAD" '取得')" \
+      "$(xlsx_cell_str "C${hrow}" "$STY_HEAD" 'シート数')"    "$(xlsx_cell_str "D${hrow}" "$STY_HEAD" '取得')" \
       "$(xlsx_cell_str "E${hrow}" "$STY_HEAD" '期間外')"      "$(xlsx_cell_str "F${hrow}" "$STY_HEAD" '出力')" \
       "$(xlsx_cell_str "G${hrow}" "$STY_HEAD" 'エラー')"      "$(xlsx_cell_str "H${hrow}" "$STY_HEAD" '警告')" \
       "$(xlsx_cell_str "I${hrow}" "$STY_HEAD" 'デプロイ')"    "$(xlsx_cell_str "J${hrow}" "$STY_HEAD" 'アンデプロイ')" \
@@ -2216,7 +2374,7 @@ xlsx_write_summary_sheet() {
       printf '<row r="%d">' "$r"
       xlsx_cell_num "A${r}" "$STY_NUM"  "$(( i + 1 ))"
       xlsx_cell_str "B${r}" "$STY_TEXT" "${GRP_NAMES[i]}"
-      xlsx_cell_str "C${r}" "$STY_TEXT" "${XLSX_SHEET_NAMES[i]}"
+      xlsx_cell_num "C${r}" "$STY_NUM"  "${GRP_SHEETS[i]}"
       xlsx_cell_num "D${r}" "$STY_NUM"  "${GRP_FETCHED[i]}"
       xlsx_cell_num "E${r}" "$STY_NUM"  "${GRP_OUTRANGE[i]}"
       xlsx_cell_num "F${r}" "$STY_NUM"  "${GRP_MATCHED[i]}"
@@ -2247,7 +2405,7 @@ xlsx_write_summary_sheet() {
 xlsx_write_key_sheet() {
   local out="$1" rowsf="$2"
   local mts group cat kcat kind lvl ls emsg row msg stream grp
-  local r=$XLSX_DATA_ROW last sd stx sw
+  local r=$XLSX_KEY_DATA_ROW last sd stx sw
 
   : > "$rowsf"
   if [[ -s "$KEY_SORTED" ]]; then
@@ -2300,17 +2458,94 @@ xlsx_write_key_sheet() {
   return 0
 }
 
+# ログストリームとシートの対応表。どのシートを「再表示」すればよいかを
+# ここだけで判断できるよう、件数と最古・最新の時刻も並べる。
+xlsx_write_streams_sheet() {
+  local out="$1" sn=${#SHT_GIDX[@]} i r b g
+  local hrow=$(( XLSX_LIST_DATA_ROW - 1 ))
+  local last=$(( XLSX_LIST_DATA_ROW + sn - 1 ))
+  (( last < XLSX_LIST_DATA_ROW )) && last=$XLSX_LIST_DATA_ROW
+  local sERR=$STY_NUM sWRN=$STY_NUM sDEP=$STY_NUM sUND=$STY_NUM sSTA=$STY_NUM sSTP=$STY_NUM
+  if [[ "$HIGHLIGHT" == "true" ]]; then
+    sERR=$(( STY_BASE + CAT_ERROR    * 4 + 3 )); sWRN=$(( STY_BASE + CAT_WARN     * 4 + 3 ))
+    sDEP=$(( STY_BASE + CAT_DEPLOY   * 4 + 3 )); sUND=$(( STY_BASE + CAT_UNDEPLOY * 4 + 3 ))
+    sSTA=$(( STY_BASE + CAT_START    * 4 + 3 )); sSTP=$(( STY_BASE + CAT_STOP     * 4 + 3 ))
+  fi
+  {
+    printf '%s' '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+    printf '%s' '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+    printf '<dimension ref="A1:N%d"/>' "$last"
+    printf '<sheetViews><sheetView workbookViewId="0"><pane ySplit="%d" topLeftCell="A%d" activePane="bottomLeft" state="frozen"/><selection pane="bottomLeft" activeCell="A%d" sqref="A%d"/></sheetView></sheetViews>' \
+      "$hrow" "$XLSX_LIST_DATA_ROW" "$XLSX_LIST_DATA_ROW" "$XLSX_LIST_DATA_ROW"
+    printf '%s' '<sheetFormatPr defaultRowHeight="15"/>'
+    printf '%s' '<cols><col min="1" max="1" width="5" customWidth="1"/><col min="2" max="2" width="40" customWidth="1"/><col min="3" max="3" width="44" customWidth="1"/><col min="4" max="4" width="24" customWidth="1"/><col min="5" max="5" width="12" customWidth="1"/><col min="6" max="6" width="9" customWidth="1"/><col min="7" max="12" width="8" customWidth="1"/><col min="13" max="14" width="23" customWidth="1"/></cols>'
+    printf '%s' '<sheetData>'
+    printf '<row r="1">%s</row>' "$(xlsx_cell_str A1 "$STY_TITLE" 'ストリーム一覧（シートとログストリームの対応表）')"
+    printf '<row r="2">%s</row>' "$(xlsx_cell_str A2 0 "各ロググループの最新のログストリームのシートだけを表示しています。${EXCEL_UNHIDE_HINT}")"
+    printf '<row r="%d">%s%s%s%s%s%s%s%s%s%s%s%s%s%s</row>' "$hrow" \
+      "$(xlsx_cell_str "A${hrow}" "$STY_HEAD" 'No')"           "$(xlsx_cell_str "B${hrow}" "$STY_HEAD" 'ロググループ')" \
+      "$(xlsx_cell_str "C${hrow}" "$STY_HEAD" 'ログストリーム')" "$(xlsx_cell_str "D${hrow}" "$STY_HEAD" 'シート名')" \
+      "$(xlsx_cell_str "E${hrow}" "$STY_HEAD" '状態')"          "$(xlsx_cell_str "F${hrow}" "$STY_HEAD" '出力')" \
+      "$(xlsx_cell_str "G${hrow}" "$STY_HEAD" 'エラー')"        "$(xlsx_cell_str "H${hrow}" "$STY_HEAD" '警告')" \
+      "$(xlsx_cell_str "I${hrow}" "$STY_HEAD" 'デプロイ')"      "$(xlsx_cell_str "J${hrow}" "$STY_HEAD" 'アンデプロイ')" \
+      "$(xlsx_cell_str "K${hrow}" "$STY_HEAD" '起動')"          "$(xlsx_cell_str "L${hrow}" "$STY_HEAD" '停止')" \
+      "$(xlsx_cell_str "M${hrow}" "$STY_HEAD" '最古(JST)')"     "$(xlsx_cell_str "N${hrow}" "$STY_HEAD" '最新(JST)')"
+    for (( i = 0; i < sn; i++ )); do
+      r=$(( XLSX_LIST_DATA_ROW + i ))
+      b=$(( i * CAT_N ))
+      g=${SHT_GIDX[i]}
+      printf '<row r="%d">' "$r"
+      xlsx_cell_num "A${r}" "$STY_NUM"  "$(( g + 1 ))"
+      xlsx_cell_str "B${r}" "$STY_TEXT" "${GRP_NAMES[g]}"
+      xlsx_cell_str "C${r}" "$STY_TEXT" "${SHT_STREAM[i]:-(該当するログなし)}"
+      xlsx_cell_str "D${r}" "$STY_TEXT" "${SHT_NAMES[i]}"
+      if [[ "${SHT_HIDDEN[i]}" == "true" ]]; then
+        xlsx_cell_str "E${r}" "$STY_TEXT" '非表示'
+      else
+        xlsx_cell_str "E${r}" "$STY_TEXT" '表示（最新）'
+      fi
+      xlsx_cell_num "F${r}" "$STY_NUM" "${SHT_COUNT[i]}"
+      xlsx_cell_num "G${r}" "$sERR" "${SHT_CAT[b + CAT_ERROR]}"
+      xlsx_cell_num "H${r}" "$sWRN" "${SHT_CAT[b + CAT_WARN]}"
+      xlsx_cell_num "I${r}" "$sDEP" "${SHT_KIND[b + CAT_DEPLOY]}"
+      xlsx_cell_num "J${r}" "$sUND" "${SHT_KIND[b + CAT_UNDEPLOY]}"
+      xlsx_cell_num "K${r}" "$sSTA" "${SHT_KIND[b + CAT_START]}"
+      xlsx_cell_num "L${r}" "$sSTP" "${SHT_KIND[b + CAT_STOP]}"
+      if [[ -n "${SHT_MINTS[i]}" ]]; then
+        epoch_ms_to_excel_serial "${SHT_MINTS[i]}"; xlsx_cell_num "M${r}" "$STY_DATE" "$EXCEL_SERIAL"
+        epoch_ms_to_excel_serial "${SHT_MAXTS[i]}"; xlsx_cell_num "N${r}" "$STY_DATE" "$EXCEL_SERIAL"
+      else
+        xlsx_cell_str "M${r}" "$STY_TEXT" '-'; xlsx_cell_str "N${r}" "$STY_TEXT" '-'
+      fi
+      printf '%s' '</row>'
+    done
+    printf '%s' '</sheetData>'
+    printf '<autoFilter ref="A%d:N%d"/>' "$hrow" "$last"
+    printf '%s' '</worksheet>'
+  } > "$out"
+  return 0
+}
+
+# 1 ログストリームぶんのログシート。ロググループ名とストリーム名は 1〜2 行目に
+# 書くため、行の側にストリーム列は持たせない（1 シート内では常に同じ値のため）。
 xlsx_write_data_sheet() {
-  local out="$1" idx="$2" rowsf="$3"
-  local group="${GRP_NAMES[idx]}" src="${GRP_FILES[idx]}"
+  local out="$1" sidx="$2" rowsf="$3"
+  local gidx="${SHT_GIDX[sidx]}"
+  local group="${GRP_NAMES[gidx]}" src="${SHT_FILES[sidx]}" stream="${SHT_STREAM[sidx]}"
   local mts ts ing eid ls cat kcat lvl kind emsg
-  local row stream msg r=$XLSX_DATA_ROW truncated="false" info last sd stx sw sn
+  local row msg r=$XLSX_DATA_ROW truncated="false" info last sd stx sw sn
+  local hrow=$(( XLSX_DATA_ROW - 1 )) note=""
+
+  note="ログストリーム: ${stream:-(該当するログがありません)}"
+  if [[ -n "$stream" && "${SHT_HIDDEN[sidx]}" != "true" ]]; then
+    note+="  ※ このロググループで最新のログストリームです"
+  fi
 
   # イベント 1 件ごとのループなので、ここではコマンド置換（$(...)）を一切使わずに
   # 文字列連結だけで行を組み立てる。$(...) は 1 回ごとに fork するため、
   # 数千件のログでは処理時間が桁違いに悪化する。
   : > "$rowsf"
-  if [[ -s "$src" ]]; then
+  if [[ -n "$src" && -s "$src" ]]; then
     {
       while IFS="$US" read -r mts ts ing eid ls cat kcat lvl kind emsg; do
         emsg="${emsg%$'\r'}"
@@ -2318,7 +2553,6 @@ xlsx_write_data_sheet() {
         if (( r >= XLSX_MAX_ROWS )); then truncated="true"; break; fi
         [[ "$HIGHLIGHT" == "true" ]] || cat=$CAT_INFO
         sd=$(( STY_BASE + cat * 4 )); stx=$(( sd + 1 )); sw=$(( sd + 2 )); sn=$(( sd + 3 ))
-        xml_escape "$ls";   stream="$XML_ESC"
         xml_escape "$kind"; kind="$XML_ESC"
         xml_escape "$lvl";  lvl="$XML_ESC"
         excel_cell_message "$emsg"; xml_escape "$EXCEL_CELL"; msg="$XML_ESC"
@@ -2326,50 +2560,51 @@ xlsx_write_data_sheet() {
         row="<row r=\"${r}\"><c r=\"A${r}\" s=\"${sd}\"><v>${EXCEL_SERIAL}</v></c>"
         row+="<c r=\"B${r}\" s=\"${stx}\" t=\"inlineStr\"><is><t xml:space=\"preserve\">${kind}</t></is></c>"
         row+="<c r=\"C${r}\" s=\"${stx}\" t=\"inlineStr\"><is><t xml:space=\"preserve\">${lvl}</t></is></c>"
-        row+="<c r=\"D${r}\" s=\"${stx}\" t=\"inlineStr\"><is><t xml:space=\"preserve\">${stream}</t></is></c>"
-        row+="<c r=\"E${r}\" s=\"${sw}\" t=\"inlineStr\"><is><t xml:space=\"preserve\">${msg}</t></is></c>"
+        row+="<c r=\"D${r}\" s=\"${sw}\" t=\"inlineStr\"><is><t xml:space=\"preserve\">${msg}</t></is></c>"
         epoch_ms_to_excel_serial "$ts"
-        row+="<c r=\"F${r}\" s=\"${sd}\"><v>${EXCEL_SERIAL}</v></c>"
-        row+="<c r=\"G${r}\" s=\"${sn}\"><v>${ts}</v></c></row>"
+        row+="<c r=\"E${r}\" s=\"${sd}\"><v>${EXCEL_SERIAL}</v></c>"
+        row+="<c r=\"F${r}\" s=\"${sn}\"><v>${ts}</v></c></row>"
         printf '%s\n' "$row"
         r=$(( r + 1 ))
       done < "$src"
     } > "$rowsf"
   fi
-  [[ "$truncated" == "true" ]] && log_warn "Excel の最大行数を超えたため、途中で打ち切りました: ${group}"
+  [[ "$truncated" == "true" ]] && log_warn "Excel の最大行数を超えたため、途中で打ち切りました: ${group} / ${stream}"
 
-  # データが 0 件なら見出し行（3 行目）が最終行。参照範囲を実在する行に合わせる
+  # データが 0 件なら見出し行が最終行。参照範囲を実在する行に合わせる
   last=$(( r - 1 ))
   info="期間(JST): $(epoch_ms_to_jst "$START_MS")  〜  $(epoch_ms_to_jst "$(( END_MS - 1 ))")"
-  info+="  /  取得 ${GRP_FETCHED[idx]} 件  /  期間外 ${GRP_OUTRANGE[idx]} 件  /  出力 ${GRP_MATCHED[idx]} 件"
+  info+="  /  このシート ${SHT_COUNT[sidx]} 件"
+  info+="  /  ロググループ全体: 取得 ${GRP_FETCHED[gidx]} 件・期間外 ${GRP_OUTRANGE[gidx]} 件・出力 ${GRP_MATCHED[gidx]} 件"
   info+="  /  $(excel_condition_text)"
 
   {
     printf '%s' '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
     printf '%s' '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
-    printf '<dimension ref="A1:G%d"/>' "$last"
-    printf '%s' '<sheetViews><sheetView workbookViewId="0"><pane ySplit="3" topLeftCell="A4" activePane="bottomLeft" state="frozen"/><selection pane="bottomLeft" activeCell="A4" sqref="A4"/></sheetView></sheetViews>'
+    printf '<dimension ref="A1:F%d"/>' "$last"
+    printf '<sheetViews><sheetView workbookViewId="0"><pane ySplit="%d" topLeftCell="A%d" activePane="bottomLeft" state="frozen"/><selection pane="bottomLeft" activeCell="A%d" sqref="A%d"/></sheetView></sheetViews>' \
+      "$hrow" "$XLSX_DATA_ROW" "$XLSX_DATA_ROW" "$XLSX_DATA_ROW"
     printf '%s' '<sheetFormatPr defaultRowHeight="15"/>'
-    printf '%s' '<cols><col min="1" max="1" width="23" customWidth="1"/><col min="2" max="2" width="14" customWidth="1"/><col min="3" max="3" width="9" customWidth="1"/><col min="4" max="4" width="30" customWidth="1"/><col min="5" max="5" width="110" customWidth="1"/><col min="6" max="6" width="23" customWidth="1"/><col min="7" max="7" width="16" customWidth="1"/></cols>'
+    printf '%s' '<cols><col min="1" max="1" width="23" customWidth="1"/><col min="2" max="2" width="14" customWidth="1"/><col min="3" max="3" width="9" customWidth="1"/><col min="4" max="4" width="120" customWidth="1"/><col min="5" max="5" width="23" customWidth="1"/><col min="6" max="6" width="16" customWidth="1"/></cols>'
     printf '%s' '<sheetData>'
     printf '<row r="1">%s</row>' "$(xlsx_cell_str A1 "$STY_TITLE" "ロググループ: ${group}")"
-    printf '<row r="2">%s</row>' "$(xlsx_cell_str A2 0 "$info")"
-    printf '<row r="3">%s%s%s%s%s%s%s</row>' \
-      "$(xlsx_cell_str A3 "$STY_HEAD" '時刻(JST)')"      "$(xlsx_cell_str B3 "$STY_HEAD" '区分')" \
-      "$(xlsx_cell_str C3 "$STY_HEAD" 'レベル')"         "$(xlsx_cell_str D3 "$STY_HEAD" 'ログストリーム')" \
-      "$(xlsx_cell_str E3 "$STY_HEAD" 'メッセージ')"     "$(xlsx_cell_str F3 "$STY_HEAD" 'イベント時刻(JST)')" \
-      "$(xlsx_cell_str G3 "$STY_HEAD" 'timestamp(ms)')"
+    printf '<row r="2">%s</row>' "$(xlsx_cell_str A2 "$STY_LABEL" "$note")"
+    printf '<row r="3">%s</row>' "$(xlsx_cell_str A3 0 "$info")"
+    printf '<row r="%d">%s%s%s%s%s%s</row>' "$hrow" \
+      "$(xlsx_cell_str "A${hrow}" "$STY_HEAD" '時刻(JST)')"  "$(xlsx_cell_str "B${hrow}" "$STY_HEAD" '区分')" \
+      "$(xlsx_cell_str "C${hrow}" "$STY_HEAD" 'レベル')"     "$(xlsx_cell_str "D${hrow}" "$STY_HEAD" 'メッセージ')" \
+      "$(xlsx_cell_str "E${hrow}" "$STY_HEAD" 'イベント時刻(JST)')" "$(xlsx_cell_str "F${hrow}" "$STY_HEAD" 'timestamp(ms)')"
     cat "$rowsf"
     printf '%s' '</sheetData>'
-    printf '<autoFilter ref="A3:G%d"/>' "$last"
+    printf '<autoFilter ref="A%d:F%d"/>' "$hrow" "$last"
     printf '%s' '</worksheet>'
   } > "$out"
   return 0
 }
 
 excel_write_xlsx() {
-  # シート構成: 1 サマリ / 2 主要イベント / 3 以降 ロググループごと
-  local dir rowsf i n=${#GRP_NAMES[@]} sheets=$(( ${#GRP_NAMES[@]} + 2 )) abs zrc=0
+  # シート構成: 1 サマリ / 2 主要イベント / 3 ストリーム一覧 / 4 以降 ストリームごと
+  local dir rowsf i state sn=${#SHT_GIDX[@]} sheets=$(( ${#SHT_GIDX[@]} + 3 )) abs zrc=0
 
   dir="$(mktempdir_tracked)"
   mkdir -p "$dir/_rels" "$dir/xl/_rels" "$dir/xl/worksheets" \
@@ -2407,16 +2642,21 @@ excel_write_xlsx() {
     printf '%s' '</Relationships>'
   } > "$dir/xl/_rels/workbook.xml.rels"
 
-  # ブック定義（シート順: サマリ -> 指定順のロググループ）
+  # ブック定義（シート順: サマリ -> 主要イベント -> ストリーム一覧 -> ログシート）
+  #   最新ストリーム以外は state="hidden" にする。サマリは必ず表示のままなので、
+  #   Excel が要求する「表示シートが 1 枚以上ある」条件は常に満たされる。
   {
     printf '%s' '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
     printf '%s' '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
     printf '%s' '<sheets>'
-    xml_escape 'サマリ';       printf '<sheet name="%s" sheetId="1" r:id="rId1"/>' "$XML_ESC"
-    xml_escape '主要イベント'; printf '<sheet name="%s" sheetId="2" r:id="rId2"/>' "$XML_ESC"
-    for (( i = 0; i < n; i++ )); do
-      xml_escape "${XLSX_SHEET_NAMES[i]}"
-      printf '<sheet name="%s" sheetId="%d" r:id="rId%d"/>' "$XML_ESC" "$(( i + 3 ))" "$(( i + 3 ))"
+    xml_escape 'サマリ';         printf '<sheet name="%s" sheetId="1" r:id="rId1"/>' "$XML_ESC"
+    xml_escape '主要イベント';   printf '<sheet name="%s" sheetId="2" r:id="rId2"/>' "$XML_ESC"
+    xml_escape 'ストリーム一覧'; printf '<sheet name="%s" sheetId="3" r:id="rId3"/>' "$XML_ESC"
+    for (( i = 0; i < sn; i++ )); do
+      state=""
+      [[ "${SHT_HIDDEN[i]}" == "true" ]] && state=' state="hidden"'
+      xml_escape "${SHT_NAMES[i]}"
+      printf '<sheet name="%s" sheetId="%d" r:id="rId%d"%s/>' "$XML_ESC" "$(( i + 4 ))" "$(( i + 4 ))" "$state"
     done
     printf '%s' '</sheets></workbook>'
   } > "$dir/xl/workbook.xml"
@@ -2426,8 +2666,9 @@ excel_write_xlsx() {
 
   rowsf="$(mktemp_tracked)"
   xlsx_write_key_sheet "$dir/xl/worksheets/sheet2.xml" "$rowsf"
-  for (( i = 0; i < n; i++ )); do
-    xlsx_write_data_sheet "$dir/xl/worksheets/sheet$(( i + 3 )).xml" "$i" "$rowsf"
+  xlsx_write_streams_sheet "$dir/xl/worksheets/sheet3.xml"
+  for (( i = 0; i < sn; i++ )); do
+    xlsx_write_data_sheet "$dir/xl/worksheets/sheet$(( i + 4 )).xml" "$i" "$rowsf"
   done
 
   # zip は作業ディレクトリを移動して実行するため、出力先を絶対パスへ直す
@@ -2474,7 +2715,7 @@ sml_write_cat_styles() {
 }
 
 excel_write_spreadsheetml() {
-  local n=${#GRP_NAMES[@]} i b r cond now group info
+  local n=${#GRP_NAMES[@]} sn=${#SHT_GIDX[@]} i g b r cond now group info note hidden
   local mts ts ing eid ls cat kcat lvl kind emsg
   # サマリの件数セルの色（--no-highlight のときは色を付けない）
   local cERR=0 cWRN=0 cDEP=0 cUND=0 cSTA=0 cSTP=0
@@ -2510,9 +2751,10 @@ excel_write_spreadsheetml() {
     printf '<Row>%s%s</Row>' "$(sml_cell_str sLabel '抽出条件')"   "$(sml_cell_str st0 "$cond")"
     printf '<Row>%s%s</Row>' "$(sml_cell_str sLabel '取得上限')"   "$(sml_cell_str st0 "ロググループごとに最大 ${MAX_EVENTS} 件")"
     printf '<Row>%s%s</Row>' "$(sml_cell_str sLabel '生ログ')"     "$(sml_cell_str st0 "$(excel_rawdir_text)")"
+    printf '<Row>%s%s</Row>' "$(sml_cell_str sLabel 'シート構成')" "$(sml_cell_str st0 "$(excel_sheetplan_text)")"
     printf '<Row>%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s</Row>' \
       "$(sml_cell_str sHead 'No')"           "$(sml_cell_str sHead 'ロググループ')" \
-      "$(sml_cell_str sHead 'シート名')"     "$(sml_cell_str sHead '取得')" \
+      "$(sml_cell_str sHead 'シート数')"     "$(sml_cell_str sHead '取得')" \
       "$(sml_cell_str sHead '期間外')"       "$(sml_cell_str sHead '出力')" \
       "$(sml_cell_str sHead 'エラー')"       "$(sml_cell_str sHead '警告')" \
       "$(sml_cell_str sHead 'デプロイ')"     "$(sml_cell_str sHead 'アンデプロイ')" \
@@ -2524,7 +2766,7 @@ excel_write_spreadsheetml() {
       printf '%s' '<Row>'
       sml_cell_num sn0 "$(( i + 1 ))"
       sml_cell_str st0 "${GRP_NAMES[i]}"
-      sml_cell_str st0 "${XLSX_SHEET_NAMES[i]}"
+      sml_cell_num sn0 "${GRP_SHEETS[i]}"
       sml_cell_num sn0 "${GRP_FETCHED[i]}"
       sml_cell_num sn0 "${GRP_OUTRANGE[i]}"
       sml_cell_num sn0 "${GRP_MATCHED[i]}"
@@ -2543,7 +2785,7 @@ excel_write_spreadsheetml() {
       sml_cell_num sn0 "${GRP_RAWFILES[i]}"
       printf '%s' '</Row>'
     done
-    printf '%s\n' '</Table><WorksheetOptions xmlns="urn:schemas-microsoft-com:office:excel"><FreezePanes/><FrozenNoSplit/><SplitHorizontal>9</SplitHorizontal><TopRowBottomPane>9</TopRowBottomPane><ActivePane>2</ActivePane></WorksheetOptions></Worksheet>'
+    printf '%s\n' '</Table><WorksheetOptions xmlns="urn:schemas-microsoft-com:office:excel"><FreezePanes/><FrozenNoSplit/><SplitHorizontal>10</SplitHorizontal><TopRowBottomPane>10</TopRowBottomPane><ActivePane>2</ActivePane></WorksheetOptions></Worksheet>'
 
     # --- 主要イベントシート（デプロイ / 起動・停止をロググループ横断で時刻順に） ---
     xml_escape '主要イベント'
@@ -2574,41 +2816,96 @@ excel_write_spreadsheetml() {
     fi
     printf '%s\n' '</Table><WorksheetOptions xmlns="urn:schemas-microsoft-com:office:excel"><FreezePanes/><FrozenNoSplit/><SplitHorizontal>3</SplitHorizontal><TopRowBottomPane>3</TopRowBottomPane><ActivePane>2</ActivePane></WorksheetOptions></Worksheet>'
 
-    # --- ロググループごとのシート ---
-    for (( i = 0; i < n; i++ )); do
-      group="${GRP_NAMES[i]}"
+    # --- ストリーム一覧シート（シートとログストリームの対応表） ---
+    xml_escape 'ストリーム一覧'
+    printf '<Worksheet ss:Name="%s"><Table>' "$XML_ESC"
+    printf '%s' '<Column ss:Width="34"/><Column ss:Width="260"/><Column ss:Width="290"/><Column ss:Width="160"/><Column ss:Width="80"/><Column ss:Width="56"/><Column ss:Width="52"/><Column ss:Width="52"/><Column ss:Width="60"/><Column ss:Width="72"/><Column ss:Width="52"/><Column ss:Width="52"/><Column ss:Width="150"/><Column ss:Width="150"/>'
+    printf '<Row>%s</Row>' "$(sml_cell_str sTitle 'ストリーム一覧（シートとログストリームの対応表）')"
+    printf '<Row>%s</Row>' "$(sml_cell_str st0 "各ロググループの最新のログストリームのシートだけを表示しています。${EXCEL_UNHIDE_HINT}")"
+    printf '<Row>%s%s%s%s%s%s%s%s%s%s%s%s%s%s</Row>' \
+      "$(sml_cell_str sHead 'No')"             "$(sml_cell_str sHead 'ロググループ')" \
+      "$(sml_cell_str sHead 'ログストリーム')" "$(sml_cell_str sHead 'シート名')" \
+      "$(sml_cell_str sHead '状態')"           "$(sml_cell_str sHead '出力')" \
+      "$(sml_cell_str sHead 'エラー')"         "$(sml_cell_str sHead '警告')" \
+      "$(sml_cell_str sHead 'デプロイ')"       "$(sml_cell_str sHead 'アンデプロイ')" \
+      "$(sml_cell_str sHead '起動')"           "$(sml_cell_str sHead '停止')" \
+      "$(sml_cell_str sHead '最古(JST)')"      "$(sml_cell_str sHead '最新(JST)')"
+    for (( i = 0; i < sn; i++ )); do
+      b=$(( i * CAT_N ))
+      g=${SHT_GIDX[i]}
+      printf '%s' '<Row>'
+      sml_cell_num sn0 "$(( g + 1 ))"
+      sml_cell_str st0 "${GRP_NAMES[g]}"
+      sml_cell_str st0 "${SHT_STREAM[i]:-(該当するログなし)}"
+      sml_cell_str st0 "${SHT_NAMES[i]}"
+      if [[ "${SHT_HIDDEN[i]}" == "true" ]]; then
+        sml_cell_str st0 '非表示'
+      else
+        sml_cell_str st0 '表示（最新）'
+      fi
+      sml_cell_num sn0 "${SHT_COUNT[i]}"
+      sml_cell_num "sn${cERR}" "${SHT_CAT[b + CAT_ERROR]}"
+      sml_cell_num "sn${cWRN}" "${SHT_CAT[b + CAT_WARN]}"
+      sml_cell_num "sn${cDEP}" "${SHT_KIND[b + CAT_DEPLOY]}"
+      sml_cell_num "sn${cUND}" "${SHT_KIND[b + CAT_UNDEPLOY]}"
+      sml_cell_num "sn${cSTA}" "${SHT_KIND[b + CAT_START]}"
+      sml_cell_num "sn${cSTP}" "${SHT_KIND[b + CAT_STOP]}"
+      if [[ -n "${SHT_MINTS[i]}" ]]; then
+        epoch_ms_to_excel_iso "${SHT_MINTS[i]}"; sml_cell_date sd0 "$EXCEL_ISO"
+        epoch_ms_to_excel_iso "${SHT_MAXTS[i]}"; sml_cell_date sd0 "$EXCEL_ISO"
+      else
+        sml_cell_str st0 '-'; sml_cell_str st0 '-'
+      fi
+      printf '%s' '</Row>'
+    done
+    printf '%s\n' '</Table><WorksheetOptions xmlns="urn:schemas-microsoft-com:office:excel"><FreezePanes/><FrozenNoSplit/><SplitHorizontal>3</SplitHorizontal><TopRowBottomPane>3</TopRowBottomPane><ActivePane>2</ActivePane></WorksheetOptions></Worksheet>'
+
+    # --- ロググループ × ログストリームごとのシート ---
+    #   最新ストリーム以外は <Visible>SheetHidden</Visible> で既定を非表示にする
+    #   （SpreadsheetML では WorksheetOptions の先頭に置く）
+    for (( i = 0; i < sn; i++ )); do
+      g=${SHT_GIDX[i]}
+      group="${GRP_NAMES[g]}"
+      note="ログストリーム: ${SHT_STREAM[i]:-(該当するログがありません)}"
+      hidden=""
+      if [[ "${SHT_HIDDEN[i]}" == "true" ]]; then
+        hidden='<Visible>SheetHidden</Visible>'
+      elif [[ -n "${SHT_STREAM[i]}" ]]; then
+        note+="  ※ このロググループで最新のログストリームです"
+      fi
       info="期間(JST): $(epoch_ms_to_jst "$START_MS")  〜  $(epoch_ms_to_jst "$(( END_MS - 1 ))")"
-      info+="  /  取得 ${GRP_FETCHED[i]} 件  /  期間外 ${GRP_OUTRANGE[i]} 件  /  出力 ${GRP_MATCHED[i]} 件  /  ${cond}"
-      xml_escape "${XLSX_SHEET_NAMES[i]}"
+      info+="  /  このシート ${SHT_COUNT[i]} 件"
+      info+="  /  ロググループ全体: 取得 ${GRP_FETCHED[g]} 件・期間外 ${GRP_OUTRANGE[g]} 件・出力 ${GRP_MATCHED[g]} 件"
+      info+="  /  ${cond}"
+      xml_escape "${SHT_NAMES[i]}"
       printf '<Worksheet ss:Name="%s"><Table>' "$XML_ESC"
-      printf '%s' '<Column ss:Width="150"/><Column ss:Width="90"/><Column ss:Width="60"/><Column ss:Width="200"/><Column ss:Width="700"/><Column ss:Width="150"/><Column ss:Width="100"/>'
+      printf '%s' '<Column ss:Width="150"/><Column ss:Width="90"/><Column ss:Width="60"/><Column ss:Width="760"/><Column ss:Width="150"/><Column ss:Width="100"/>'
       printf '<Row>%s</Row>' "$(sml_cell_str sTitle "ロググループ: ${group}")"
+      printf '<Row>%s</Row>' "$(sml_cell_str sLabel "$note")"
       printf '<Row>%s</Row>' "$(sml_cell_str st0 "$info")"
-      printf '<Row>%s%s%s%s%s%s%s</Row>' \
-        "$(sml_cell_str sHead '時刻(JST)')"      "$(sml_cell_str sHead '区分')" \
-        "$(sml_cell_str sHead 'レベル')"         "$(sml_cell_str sHead 'ログストリーム')" \
-        "$(sml_cell_str sHead 'メッセージ')"     "$(sml_cell_str sHead 'イベント時刻(JST)')" \
-        "$(sml_cell_str sHead 'timestamp(ms)')"
-      if [[ -s "${GRP_FILES[i]}" ]]; then
+      printf '<Row>%s%s%s%s%s%s</Row>' \
+        "$(sml_cell_str sHead '時刻(JST)')"  "$(sml_cell_str sHead '区分')" \
+        "$(sml_cell_str sHead 'レベル')"     "$(sml_cell_str sHead 'メッセージ')" \
+        "$(sml_cell_str sHead 'イベント時刻(JST)')" "$(sml_cell_str sHead 'timestamp(ms)')"
+      if [[ -n "${SHT_FILES[i]}" && -s "${SHT_FILES[i]}" ]]; then
         r=0
         while IFS="$US" read -r mts ts ing eid ls cat kcat lvl kind emsg; do
           emsg="${emsg%$'\r'}"
           [[ "$mts" =~ ^-?[0-9]+$ ]] || continue
           r=$(( r + 1 ))
-          (( r >= XLSX_MAX_ROWS - 3 )) && break
+          (( r >= XLSX_MAX_ROWS - 4 )) && break
           [[ "$HIGHLIGHT" == "true" ]] || cat=$CAT_INFO
           printf '%s' '<Row>'
           epoch_ms_to_excel_iso "$mts"; sml_cell_date "sd${cat}" "$EXCEL_ISO"
           sml_cell_str "st${cat}" "$kind"
           sml_cell_str "st${cat}" "$lvl"
-          sml_cell_str "st${cat}" "$ls"
           excel_cell_message "$emsg"; sml_cell_str "sw${cat}" "$EXCEL_CELL"
           epoch_ms_to_excel_iso "$ts"; sml_cell_date "sd${cat}" "$EXCEL_ISO"
           sml_cell_num "sn${cat}" "$ts"
           printf '%s' '</Row>'
-        done < "${GRP_FILES[i]}"
+        done < "${SHT_FILES[i]}"
       fi
-      printf '%s\n' '</Table><WorksheetOptions xmlns="urn:schemas-microsoft-com:office:excel"><FreezePanes/><FrozenNoSplit/><SplitHorizontal>3</SplitHorizontal><TopRowBottomPane>3</TopRowBottomPane><ActivePane>2</ActivePane></WorksheetOptions></Worksheet>'
+      printf '%s\n' "</Table><WorksheetOptions xmlns=\"urn:schemas-microsoft-com:office:excel\">${hidden}<FreezePanes/><FrozenNoSplit/><SplitHorizontal>4</SplitHorizontal><TopRowBottomPane>4</TopRowBottomPane><ActivePane>2</ActivePane></WorksheetOptions></Worksheet>"
     done
     printf '%s\n' '</Workbook>'
   } > "$EXCEL_FILE" || die "SpreadsheetML ファイルの書き出しに失敗しました: ${EXCEL_FILE}" "$EX_OUTPUT"
@@ -2850,7 +3147,7 @@ run_once() {
     LOG_GROUP="$g"
     (( total > 1 )) && print_group_header "$idx" "$total" "$g"
 
-    # 収集用のバッファ（ロググループごとに 1 ファイル = 1 シート + 生ログ 1 組）
+    # 収集用のバッファ（ロググループごとに 1 ファイル。Excel と生ログはここから分割する）
     COLLECT_BUF=""; COLLECT_MIN=""; COLLECT_MAX=""
     [[ "$collect" == "true" ]] && COLLECT_BUF="$(mktemp_tracked)"
     CUR_CAT=(); CUR_KIND=()
@@ -3021,7 +3318,8 @@ print_plan() {
   [[ "$IGNORE_CASE" == "true" ]] && log_info "  大文字小文字    : 無視"
   log_info "  出力形式        : ${OUTPUT}$( [[ "$OUTPUT" == "none" ]] && printf '（画面へは出力しません）' )"
   if [[ -n "$EXCEL_FILE" ]]; then
-    log_info "  Excel 出力      : ${EXCEL_FILE}（形式: ${EXCEL_FORMAT}, シート: サマリ + 主要イベント + ロググループごと）"
+    log_info "  Excel 出力      : ${EXCEL_FILE}（形式: ${EXCEL_FORMAT}, シート: サマリ + 主要イベント + ストリーム一覧 + ロググループ × ログストリームごと）"
+    log_info "  Excel のシート  : 各ロググループの最新ログストリーム以外は既定で非表示"
     log_info "  Excel の書式    : フォント ${EXCEL_FONT_NAME} / 区分ごとの色分け: $( [[ "$HIGHLIGHT" == "true" ]] && printf '有効' || printf '無効' )"
   fi
   if [[ "$RAW_ENABLED" == "true" ]]; then
